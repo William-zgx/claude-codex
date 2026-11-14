@@ -3538,7 +3538,7 @@ export class CodexClaudeAppServer {
       diff: '',
       error: null,
     }
-    this.store.upsertTurn(turn)
+    this.claimSideTurn(turn)
     recordRunEvent('turn.started', {
       threadId,
       turnId,
@@ -3610,7 +3610,7 @@ export class CodexClaudeAppServer {
       diff: '',
       error: null,
     }
-    this.store.upsertTurn(turn)
+    this.claimSideTurn(turn)
     recordRunEvent('turn.started', {
       threadId,
       turnId,
@@ -3976,7 +3976,6 @@ export class CodexClaudeAppServer {
 
   private async turnStart(peer: RpcPeer, params: Record<string, unknown>): Promise<unknown> {
     const threadId = stringOr(params.threadId, '')
-    this.flushPendingTurnEnds(threadId)
     const thread = this.store.getThread(threadId)
     if (!thread) throw unknownThread(threadId)
     this.checkModelProfileBinding(thread)
@@ -4124,6 +4123,10 @@ export class CodexClaudeAppServer {
     // loser still joins as before, while a remote one is rejected without
     // persisting a user item or launching another model run.
     for (;;) {
+      // A turn that ended while this input waited may still have its
+      // refused terminal write pending; settle it so it is not taken for an
+      // owner in another process.
+      this.flushPendingTurnEnds(threadId)
       const claim = this.store.claimTurn(turn)
       if (claim.claimed) break
       const ownedHere = this.activeTurnByThread.get(threadId) === claim.activeTurn.id
@@ -7539,7 +7542,16 @@ export class CodexClaudeAppServer {
       diff: '',
       error: null,
     }
-    this.store.upsertTurn(turn)
+    try {
+      this.claimSideTurn(turn)
+    } catch (error) {
+      debugLog('turn.continuation_skipped', {
+        threadId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      this.checkIdle()
+      return
+    }
     recordRunEvent('turn.started', {
       threadId,
       turnId: turn.id,
@@ -10294,6 +10306,23 @@ export class CodexClaudeAppServer {
       this.retryTurnEnd(turn.threadId, turn.id, status, error, 1)
       return settledTurn(turn, status, error)
     }
+  }
+
+  // Writes a review, compaction or continuation turn unless another adapter
+  // process runs the thread. A turn this process runs keeps the previous
+  // in-process behaviour (the caller decides), so only the cross-process
+  // case is refused.
+  private claimSideTurn(turn: TurnRecord): void {
+    this.flushPendingTurnEnds(turn.threadId)
+    const claim = this.store.claimTurn(turn)
+    if (claim.claimed) return
+    if (this.activeTurnByThread.get(turn.threadId) === claim.activeTurn.id) {
+      this.store.upsertTurn(turn)
+      return
+    }
+    throw invalidRequest(
+      `thread ${turn.threadId} has an active turn in another adapter process; retry after it completes`,
+    )
   }
 
   private flushPendingTurnEnds(threadId: string): void {
