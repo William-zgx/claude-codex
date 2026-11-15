@@ -5,6 +5,7 @@ import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { runWorkflowCli, type WorkflowCliIo } from '../src/workflow-cli.mjs'
 import {
   type WorkflowState,
@@ -223,6 +224,124 @@ test('workflow CLI preserves concurrent enqueues after concurrent stale reads', 
   const state = await new WorkflowStateStore(statePath).read()
   assert.deepEqual(state?.tasks.map((task) => task.id).sort(), ['task-a', 'task-b'])
 })
+
+test('workflow CLI starts a schedule lease after waiting for the state lock', {
+  timeout: 10_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  await runWorkflowCli(
+    ['enqueue', '--state', statePath, '--id', 'task-a', '--prompt', 'Integrate scheduler.'],
+    captureIo(),
+  )
+
+  const holder = await holdWorkflowStateLock(statePath)
+  const ioA = captureIo()
+  const scheduleA = runWorkflowCli(
+    ['schedule', '--state', statePath, '--worker', 'worker-a', '--ttl-ms', '300'],
+    ioA,
+  )
+  // The lock wait exceeds the requested lease TTL.
+  await delay(600)
+  await holder.release()
+  assert.equal(await scheduleA, 0, ioA.stderrText())
+  const returnedAt = Date.now()
+
+  const claim = jsonOf<ScheduleOutput>(ioA.stdoutText())
+  assert.equal(claim.type, 'claimed')
+  const expiresAt = claim.type === 'claimed' ? Date.parse(claim.task.lease?.expiresAt ?? '') : 0
+  assert.ok(expiresAt > returnedAt, `lease expired ${returnedAt - expiresAt}ms before return`)
+
+  const ioB = captureIo()
+  await runWorkflowCli(
+    ['schedule', '--state', statePath, '--worker', 'worker-b', '--ttl-ms', '300'],
+    ioB,
+  )
+  assert.equal(jsonOf<ScheduleOutput>(ioB.stdoutText()).type, 'idle')
+})
+
+test('workflow CLI renews a heartbeat lease after waiting for the state lock', {
+  timeout: 10_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  await runWorkflowCli(
+    ['enqueue', '--state', statePath, '--id', 'task-a', '--prompt', 'Integrate scheduler.'],
+    captureIo(),
+  )
+  await runWorkflowCli(
+    ['schedule', '--state', statePath, '--worker', 'worker-a', '--ttl-ms', '60000'],
+    captureIo(),
+  )
+
+  const holder = await holdWorkflowStateLock(statePath)
+  const io = captureIo()
+  const heartbeat = runWorkflowCli(
+    [
+      'heartbeat',
+      '--state',
+      statePath,
+      '--task',
+      'task-a',
+      '--worker',
+      'worker-a',
+      '--ttl-ms',
+      '300',
+    ],
+    io,
+  )
+  await delay(600)
+  await holder.release()
+  assert.equal(await heartbeat, 0, io.stderrText())
+  const returnedAt = Date.now()
+
+  const state = await new WorkflowStateStore(statePath).read()
+  const expiresAt = Date.parse(state?.tasks[0]?.lease?.expiresAt ?? '')
+  assert.ok(expiresAt > returnedAt, `lease expired ${returnedAt - expiresAt}ms before return`)
+})
+
+test('workflow CLI keeps an explicit --now for lease timing', async () => {
+  const statePath = await tempStatePath()
+  await runWorkflowCli(
+    ['enqueue', '--state', statePath, '--id', 'task-a', '--prompt', 'Integrate scheduler.'],
+    captureIo(),
+  )
+  const io = captureIo()
+  await runWorkflowCli(
+    ['schedule', '--state', statePath, '--ttl-ms', '1000', '--now', '2026-07-04T00:00:00.000Z'],
+    io,
+  )
+  const claim = jsonOf<ScheduleOutput>(io.stdoutText())
+  assert.equal(claim.type === 'claimed' && claim.task.lease?.expiresAt, '2026-07-04T00:00:01.000Z')
+})
+
+// Holds the state lock from a real transaction, paused at its write, until released.
+async function holdWorkflowStateLock(statePath: string): Promise<{ release(): Promise<void> }> {
+  const store = new WorkflowStateStore(statePath)
+  const write = store.write.bind(store)
+  let unblock: () => void = () => {}
+  let locked: () => void = () => {}
+  const isLocked = new Promise<void>((resolve) => {
+    locked = resolve
+  })
+  store.write = async (state) => {
+    locked()
+    await new Promise<void>((resolve) => {
+      unblock = resolve
+    })
+    await write(state)
+  }
+  const transaction = store.transact(emptyStateForTest(), (state) => ({ state, value: null }))
+  await isLocked
+  return {
+    async release() {
+      unblock()
+      await transaction
+    },
+  }
+}
+
+function emptyStateForTest(): WorkflowState {
+  return { version: 1, tasks: [] }
+}
 
 interface EnqueueOutput {
   readonly task: WorkflowTask

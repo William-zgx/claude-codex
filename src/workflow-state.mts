@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { link, mkdir, open, readFile, rename, rm, stat } from 'node:fs/promises'
+import { link, mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -119,109 +119,217 @@ export class WorkflowStateStore {
   }
 }
 
-interface WorkflowStateLockSnapshot {
-  readonly record: WorkflowStateLockRecord | null
+// The lock is a directory of numbered generations; the highest number is the current one.
+// Each generation is either held (a holder record) or free. Acquiring and releasing both
+// work by exclusively creating the next generation, so two waiters acting on the same
+// observation race for one slot and only one can win. A waiter with a stale observation
+// can therefore only fail to create an already-taken slot; nothing ever removes the
+// current generation, so a stale-lock takeover cannot displace a live holder.
+type WorkflowStateLockEntry =
+  | ({ readonly state: 'held' } & WorkflowStateLockRecord)
+  | { readonly state: 'free'; readonly token: string }
+
+interface WorkflowStateLockHead {
+  readonly generation: number
+  readonly text: string
+  readonly entry: WorkflowStateLockEntry | null
   readonly mtimeMs: number
+}
+
+interface HeldWorkflowStateLock {
+  readonly generation: number
+  readonly token: string
 }
 
 const localHostname = hostname()
 const lockRetryMs = 10
+const lockGenerationPattern = /^\d+$/
 
 async function acquireWorkflowStateLock(
   path: string,
   options: { readonly timeoutMs: number; readonly staleMs: number },
 ): Promise<() => Promise<void>> {
-  const lockPath = `${path}.lock`
+  const lockDir = `${path}.lock`
   const startedAt = Date.now()
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
+  await ensureWorkflowStateLockDir(lockDir)
 
   while (true) {
-    const acquired = await tryCreateWorkflowStateLock(lockPath)
-    if (acquired) {
-      return () => releaseWorkflowStateLock(lockPath, acquired.token)
+    const head = await readWorkflowStateLockHead(lockDir)
+    if (head && isWorkflowStateLockAvailable(head, options.staleMs)) {
+      const held = await claimWorkflowStateLockGeneration(lockDir, head)
+      if (held) return () => releaseWorkflowStateLock(lockDir, held)
     }
 
-    const holder = await readWorkflowStateLock(lockPath)
     const elapsedMs = Date.now() - startedAt
     if (elapsedMs >= options.timeoutMs) {
-      throw new WorkflowStateLockTimeoutError(lockPath, options.timeoutMs, holder?.record ?? null)
-    }
-    if (!holder) {
-      await delay(Math.min(lockRetryMs, options.timeoutMs - elapsedMs))
-      continue
-    }
-
-    if (isWorkflowStateLockStale(holder, options.staleMs)) {
-      await quarantineStaleWorkflowStateLock(lockPath, holder)
-      // Let concurrent stale-lock observations finish their quarantine attempts before
-      // racing to install the next generation.
-      await delay(lockRetryMs)
-      continue
+      const holder = head?.entry?.state === 'held' ? head.entry : null
+      throw new WorkflowStateLockTimeoutError(lockDir, options.timeoutMs, holder)
     }
     await delay(Math.min(lockRetryMs, options.timeoutMs - elapsedMs))
   }
 }
 
-async function tryCreateWorkflowStateLock(
-  lockPath: string,
-): Promise<WorkflowStateLockRecord | null> {
-  const record: WorkflowStateLockRecord = {
+async function ensureWorkflowStateLockDir(lockDir: string): Promise<void> {
+  await mkdir(dirname(lockDir), { recursive: true, mode: 0o700 })
+  try {
+    if ((await stat(lockDir)).isDirectory()) return
+  } catch (error) {
+    if (!hasErrorCode(error, 'ENOENT')) throw error
+  }
+  // Publish the directory together with its first (free) generation, so a lock directory
+  // is never observed without a current generation.
+  const staging = `${lockDir}.${process.pid}.${randomUUID()}.tmp`
+  await mkdir(staging, { mode: 0o700 })
+  try {
+    await writeWorkflowStateLockEntry(join(staging, '0'), { state: 'free', token: randomUUID() })
+    await rename(staging, lockDir)
+  } catch (error) {
+    if (!hasErrorCode(error, 'EEXIST') && !hasErrorCode(error, 'ENOTEMPTY')) throw error
+  } finally {
+    await rm(staging, { recursive: true, force: true })
+  }
+}
+
+async function claimWorkflowStateLockGeneration(
+  lockDir: string,
+  predecessor: WorkflowStateLockHead,
+): Promise<HeldWorkflowStateLock | null> {
+  const generation = predecessor.generation + 1
+  const entry: WorkflowStateLockEntry = {
+    state: 'held',
     pid: process.pid,
     hostname: localHostname,
     acquiredAt: new Date().toISOString(),
     token: randomUUID(),
   }
-  const tempPath = `${lockPath}.${process.pid}.${record.token}.tmp`
+  if (!(await linkWorkflowStateLockGeneration(lockDir, generation, entry))) return null
+  if (!(await isWorkflowStateLockPredecessorIntact(lockDir, predecessor))) {
+    await rm(join(lockDir, String(generation)), { force: true })
+    return null
+  }
+  await compactWorkflowStateLock(lockDir, generation)
+  return { generation, token: entry.token }
+}
+
+async function releaseWorkflowStateLock(
+  lockDir: string,
+  { generation, token }: HeldWorkflowStateLock,
+): Promise<void> {
+  const holder = await readWorkflowStateLockGeneration(lockDir, generation)
+  if (holder?.entry?.token !== token) return
+  const free: WorkflowStateLockEntry = { state: 'free', token: randomUUID() }
+  // If a stale takeover already superseded this generation the slot is taken and the
+  // newer holder is left alone.
+  if (!(await linkWorkflowStateLockGeneration(lockDir, generation + 1, free))) return
+  if (!(await isWorkflowStateLockPredecessorIntact(lockDir, holder))) {
+    await rm(join(lockDir, String(generation + 1)), { force: true })
+    return
+  }
+  await compactWorkflowStateLock(lockDir, generation + 1)
+}
+
+// Compaction deletes old generations, so a slot number can be created again after it was
+// removed. Compaction deletes in ascending order, so if the predecessor still holds the
+// exact record we observed, the new slot was never used before and the predecessor was
+// still current when we created it.
+async function isWorkflowStateLockPredecessorIntact(
+  lockDir: string,
+  predecessor: WorkflowStateLockHead,
+): Promise<boolean> {
+  const current = await readWorkflowStateLockGeneration(lockDir, predecessor.generation)
+  return current?.text === predecessor.text
+}
+
+async function compactWorkflowStateLock(lockDir: string, current: number): Promise<void> {
+  const old = (await listWorkflowStateLockGenerations(lockDir))
+    .filter((generation) => generation < current)
+    .sort((left, right) => left - right)
+  for (const generation of old) await rm(join(lockDir, String(generation)), { force: true })
+}
+
+async function linkWorkflowStateLockGeneration(
+  lockDir: string,
+  generation: number,
+  entry: WorkflowStateLockEntry,
+): Promise<boolean> {
+  const tempPath = join(lockDir, `${generation}.${process.pid}.${randomUUID()}.tmp`)
   try {
-    const handle = await open(tempPath, 'wx', 0o600)
-    try {
-      await handle.writeFile(JSON.stringify(record), 'utf8')
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-    // Hard-linking a complete record avoids exposing a partially written lock while
-    // retaining exclusive-create semantics across processes.
-    await link(tempPath, lockPath)
-    return record
+    await writeWorkflowStateLockEntry(tempPath, entry)
+    // Hard-linking a complete record keeps exclusive-create semantics without ever
+    // exposing a partially written generation.
+    await link(tempPath, join(lockDir, String(generation)))
+    return true
   } catch (error) {
-    if (hasErrorCode(error, 'EEXIST')) return null
+    if (hasErrorCode(error, 'EEXIST')) return false
     throw error
   } finally {
     await rm(tempPath, { force: true })
   }
 }
 
-async function readWorkflowStateLock(lockPath: string): Promise<WorkflowStateLockSnapshot | null> {
+async function writeWorkflowStateLockEntry(
+  path: string,
+  entry: WorkflowStateLockEntry,
+): Promise<void> {
+  const handle = await open(path, 'wx', 0o600)
   try {
-    const info = await stat(lockPath)
-    const text = await readFile(lockPath, 'utf8')
-    return { record: parseWorkflowStateLockRecord(text), mtimeMs: info.mtimeMs }
+    await handle.writeFile(JSON.stringify(entry), 'utf8')
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function listWorkflowStateLockGenerations(lockDir: string): Promise<number[]> {
+  return (await readdir(lockDir))
+    .filter((name) => lockGenerationPattern.test(name))
+    .map(Number)
+    .filter(Number.isSafeInteger)
+}
+
+async function readWorkflowStateLockHead(lockDir: string): Promise<WorkflowStateLockHead | null> {
+  const generations = await listWorkflowStateLockGenerations(lockDir)
+  if (generations.length === 0) return null
+  // A missing head was compacted by a newer generation; the caller retries.
+  return readWorkflowStateLockGeneration(lockDir, Math.max(...generations))
+}
+
+async function readWorkflowStateLockGeneration(
+  lockDir: string,
+  generation: number,
+): Promise<WorkflowStateLockHead | null> {
+  const path = join(lockDir, String(generation))
+  try {
+    const info = await stat(path)
+    const text = await readFile(path, 'utf8')
+    return { generation, text, entry: parseWorkflowStateLockEntry(text), mtimeMs: info.mtimeMs }
   } catch (error) {
     if (hasErrorCode(error, 'ENOENT')) return null
     throw error
   }
 }
 
-function parseWorkflowStateLockRecord(text: string): WorkflowStateLockRecord | null {
+function parseWorkflowStateLockEntry(text: string): WorkflowStateLockEntry | null {
   let value: unknown
   try {
     value = JSON.parse(text)
   } catch {
     return null
   }
+  if (!isRecord(value) || typeof value.token !== 'string') return null
+  if (value.state === 'free') return { state: 'free', token: value.token }
   if (
-    !isRecord(value) ||
+    value.state !== 'held' ||
     typeof value.pid !== 'number' ||
     !Number.isInteger(value.pid) ||
     value.pid <= 0 ||
     typeof value.hostname !== 'string' ||
-    typeof value.acquiredAt !== 'string' ||
-    typeof value.token !== 'string'
+    typeof value.acquiredAt !== 'string'
   ) {
     return null
   }
   return {
+    state: 'held',
     pid: value.pid,
     hostname: value.hostname,
     acquiredAt: value.acquiredAt,
@@ -229,88 +337,18 @@ function parseWorkflowStateLockRecord(text: string): WorkflowStateLockRecord | n
   }
 }
 
-function isWorkflowStateLockStale(snapshot: WorkflowStateLockSnapshot, staleMs: number): boolean {
-  const record = snapshot.record
-  if (record?.hostname === localHostname) {
+function isWorkflowStateLockAvailable(head: WorkflowStateLockHead, staleMs: number): boolean {
+  const entry = head.entry
+  if (entry?.state === 'free') return true
+  if (entry?.hostname === localHostname) {
     try {
-      process.kill(record.pid, 0)
+      process.kill(entry.pid, 0)
     } catch (error) {
       if (hasErrorCode(error, 'ESRCH')) return true
     }
   }
-  const acquiredAtMs = record ? Date.parse(record.acquiredAt) : snapshot.mtimeMs
+  const acquiredAtMs = entry ? Date.parse(entry.acquiredAt) : head.mtimeMs
   return Number.isFinite(acquiredAtMs) && Date.now() - acquiredAtMs >= staleMs
-}
-
-async function quarantineStaleWorkflowStateLock(
-  lockPath: string,
-  expected: WorkflowStateLockSnapshot,
-): Promise<void> {
-  // Recheck before renaming so a waiter acting on an old observation does not
-  // normally move a live next-generation lock.
-  const current = await readWorkflowStateLock(lockPath)
-  if (!current || !sameWorkflowStateLock(current, expected)) return
-
-  const quarantinePath = `${lockPath}.${process.pid}.${randomUUID()}.stale`
-  try {
-    await rename(lockPath, quarantinePath)
-  } catch (error) {
-    if (hasErrorCode(error, 'ENOENT')) return
-    throw error
-  }
-
-  const quarantined = await readWorkflowStateLock(quarantinePath)
-  if (quarantined && sameWorkflowStateLock(quarantined, expected)) {
-    await rm(quarantinePath, { force: true })
-    return
-  }
-
-  // Another waiter installed a new generation between our check and rename.
-  // Put that generation back without overwriting any lock created since.
-  if (quarantined) await restoreQuarantinedWorkflowStateLock(quarantinePath, lockPath)
-}
-
-function sameWorkflowStateLock(
-  left: WorkflowStateLockSnapshot,
-  right: WorkflowStateLockSnapshot,
-): boolean {
-  if (left.record || right.record) return left.record?.token === right.record?.token
-  return left.mtimeMs === right.mtimeMs
-}
-
-async function restoreQuarantinedWorkflowStateLock(
-  quarantinePath: string,
-  lockPath: string,
-): Promise<void> {
-  try {
-    await link(quarantinePath, lockPath)
-  } catch (error) {
-    if (!hasErrorCode(error, 'EEXIST') && !hasErrorCode(error, 'ENOENT')) throw error
-  } finally {
-    await rm(quarantinePath, { force: true })
-  }
-}
-
-async function releaseWorkflowStateLock(lockPath: string, token: string): Promise<void> {
-  const current = await readWorkflowStateLock(lockPath)
-  if (current?.record?.token !== token) return
-
-  const releasePath = `${lockPath}.${process.pid}.${randomUUID()}.release`
-  try {
-    await rename(lockPath, releasePath)
-  } catch (error) {
-    if (hasErrorCode(error, 'ENOENT')) return
-    throw error
-  }
-
-  const released = await readWorkflowStateLock(releasePath)
-  if (released?.record?.token === token) {
-    await rm(releasePath, { force: true })
-    return
-  }
-  // A conservative stale takeover may have replaced our generation while a
-  // long transition was still finishing. Never delete its lock.
-  if (released) await restoreQuarantinedWorkflowStateLock(releasePath, lockPath)
 }
 
 export function parseWorkflowStateJson(text: string): WorkflowState {

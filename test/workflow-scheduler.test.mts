@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { readFileSync } from 'node:fs'
-import { mkdtemp, readdir, writeFile } from 'node:fs/promises'
+import { readdirSync, readFileSync } from 'node:fs'
+import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -75,15 +75,17 @@ test('workflow state store takes over a dead local lock without losing concurren
 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'claude-codex-workflow-state-'))
   const statePath = join(dir, 'workflow-state.json')
-  const lockPath = `${statePath}.lock`
+  const lockDir = `${statePath}.lock`
   const deadProcess = spawn(process.execPath, ['-e', ''])
   const [exitCode] = (await once(deadProcess, 'close')) as [number | null]
   assert.equal(exitCode, 0)
   const deadPid = deadProcess.pid
   assert.ok(deadPid)
+  await mkdir(lockDir)
   await writeFile(
-    lockPath,
+    join(lockDir, '7'),
     JSON.stringify({
+      state: 'held',
       pid: deadPid,
       hostname: hostname(),
       acquiredAt: new Date().toISOString(),
@@ -95,11 +97,11 @@ test('workflow state store takes over a dead local lock without losing concurren
     new WorkflowStateStore(statePath, { lockTimeoutMs: 2_000, lockStaleMs: 60_000 }),
     new WorkflowStateStore(statePath, { lockTimeoutMs: 2_000, lockStaleMs: 60_000 }),
   ]
-  const observedLocks: WorkflowStateLockRecord[] = []
+  const observedLocks: LockGeneration[] = []
   await Promise.all(
     stores.map((store, index) =>
       store.transact(sampleState(), (current) => {
-        observedLocks.push(JSON.parse(readFileSync(lockPath, 'utf8')) as WorkflowStateLockRecord)
+        observedLocks.push(currentLockGeneration(lockDir))
         return {
           state: { ...current, tasks: [...current.tasks, task({ id: `after-${index}` })] },
           value: index,
@@ -111,13 +113,18 @@ test('workflow state store takes over a dead local lock without losing concurren
   const state = await new WorkflowStateStore(statePath).read()
   assert.deepEqual(state?.tasks.map((task) => task.id).sort(), ['after-0', 'after-1', 'scheduler'])
   assert.equal(observedLocks.length, 2)
-  assert.equal(new Set(observedLocks.map((record) => record.token)).size, 2)
-  for (const record of observedLocks) {
+  assert.equal(new Set(observedLocks.map(({ record }) => record.token)).size, 2)
+  for (const { generation, record } of observedLocks) {
+    assert.ok(generation > 7)
+    assert.equal(record.state, 'held')
     assert.equal(record.pid, process.pid)
     assert.equal(record.hostname, hostname())
-    assert.ok(Number.isFinite(Date.parse(record.acquiredAt)))
+    assert.ok(Number.isFinite(Date.parse(record.acquiredAt ?? '')))
   }
-  assert.deepEqual(await readdir(dir), ['workflow-state.json'])
+  assert.deepEqual((await readdir(dir)).sort(), ['workflow-state.json', 'workflow-state.json.lock'])
+  // Only the current, released generation remains.
+  assert.equal((await readdir(lockDir)).length, 1)
+  assert.equal(currentLockGeneration(lockDir).record.state, 'free')
 })
 
 test('workflow state store times out with live holder details instead of waiting forever', {
@@ -125,14 +132,16 @@ test('workflow state store times out with live holder details instead of waiting
 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'claude-codex-workflow-state-'))
   const statePath = join(dir, 'workflow-state.json')
-  const lockPath = `${statePath}.lock`
-  const holder: WorkflowStateLockRecord = {
+  const lockDir = `${statePath}.lock`
+  const holder = {
+    state: 'held',
     pid: process.pid,
     hostname: hostname(),
     acquiredAt: new Date().toISOString(),
     token: 'live-lock',
   }
-  await writeFile(lockPath, JSON.stringify(holder))
+  await mkdir(lockDir)
+  await writeFile(join(lockDir, '3'), JSON.stringify(holder))
   const store = new WorkflowStateStore(statePath, {
     lockTimeoutMs: 50,
     lockStaleMs: 60_000,
@@ -147,9 +156,41 @@ test('workflow state store times out with live holder details instead of waiting
       return true
     },
   )
-  assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), holder)
+  assert.deepEqual(await readdir(lockDir), ['3'])
+  assert.deepEqual(JSON.parse(readFileSync(join(lockDir, '3'), 'utf8')), holder)
   assert.equal(await store.read(), null)
 })
+
+test('workflow state store reuses its lock across sequential transactions', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-codex-workflow-state-'))
+  const statePath = join(dir, 'workflow-state.json')
+  const store = new WorkflowStateStore(statePath, { lockTimeoutMs: 1_000 })
+
+  for (let index = 0; index < 3; index += 1) {
+    await store.transact(sampleState(), (current) => ({ state: current, value: null }))
+  }
+
+  const lockDir = `${statePath}.lock`
+  assert.equal((await readdir(lockDir)).length, 1)
+  const head = currentLockGeneration(lockDir)
+  assert.equal(head.generation, 6)
+  assert.equal(head.record.state, 'free')
+})
+
+interface LockGeneration {
+  readonly generation: number
+  readonly record: Partial<WorkflowStateLockRecord> & { readonly state?: string }
+}
+
+function currentLockGeneration(lockDir: string): LockGeneration {
+  const generation = Math.max(
+    ...readdirSync(lockDir)
+      .filter((name) => /^\d+$/.test(name))
+      .map(Number),
+  )
+  const record = JSON.parse(readFileSync(join(lockDir, String(generation)), 'utf8'))
+  return { generation, record }
+}
 
 test('workflow scheduler claims highest priority runnable task with a lease', () => {
   const state: WorkflowState = {

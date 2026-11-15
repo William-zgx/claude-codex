@@ -36,22 +36,25 @@ export async function runWorkflowCli(
   }
   const store = new WorkflowStateStore(statePath(parsed))
   const state = (await store.read()) ?? emptyState()
-  const now = new Date(stringOption(parsed, 'now') ?? Date.now())
+  // Transitions that wait for the state lock must sample the clock once the lock is held, or
+  // a lease can already be expired when it is returned.
+  const clock = (): Date => new Date(stringOption(parsed, 'now') ?? Date.now())
+  const now = clock()
 
   switch (command) {
     case 'enqueue': {
-      const task = taskFromArgs(parsed, now)
-      await store.transact(emptyState(), (current) => ({
-        state: upsertTask(current, task),
-        value: task,
-      }))
+      const requested = taskFromArgs(parsed, now)
+      const task = await store.transact(emptyState(), (current) => {
+        const enqueued = { ...requested, updatedAt: clock().toISOString() }
+        return { state: upsertTask(current, enqueued), value: enqueued }
+      })
       writeJson(io.stdout, { status: 'enqueued', statePath: store.path, task })
       return 0
     }
     case 'schedule': {
       const decision = await store.transact(emptyState(), (current) => {
         const next = scheduleNextWorkflowTask(current, {
-          now,
+          now: clock(),
           workerId: stringOption(parsed, 'worker') ?? `worker-${process.pid}`,
           leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
         })
@@ -64,7 +67,7 @@ export async function runWorkflowCli(
       const taskId = requiredOption(parsed, 'task')
       await store.transact(emptyState(), (current) => ({
         state: renewWorkflowLease(current, taskId, {
-          now,
+          now: clock(),
           workerId: requiredOption(parsed, 'worker'),
           leaseTtlMs: numberOption(parsed, 'ttl-ms') ?? 30 * 60 * 1000,
         }),
@@ -76,7 +79,7 @@ export async function runWorkflowCli(
     case 'complete': {
       const taskId = requiredOption(parsed, 'task')
       await store.transact(emptyState(), (current) => ({
-        state: completeWorkflowTask(current, taskId, now),
+        state: completeWorkflowTask(current, taskId, clock()),
         value: null,
       }))
       writeJson(io.stdout, { status: 'completed', statePath: store.path, taskId })
@@ -85,7 +88,7 @@ export async function runWorkflowCli(
     case 'fail': {
       const taskId = requiredOption(parsed, 'task')
       await store.transact(emptyState(), (current) => ({
-        state: failWorkflowTask(current, taskId, requiredOption(parsed, 'error'), now),
+        state: failWorkflowTask(current, taskId, requiredOption(parsed, 'error'), clock()),
         value: null,
       }))
       writeJson(io.stdout, { status: 'failed-or-requeued', statePath: store.path, taskId })
@@ -94,7 +97,7 @@ export async function runWorkflowCli(
     case 'block': {
       const taskId = requiredOption(parsed, 'task')
       await store.transact(emptyState(), (current) => ({
-        state: blockWorkflowTask(current, taskId, requiredOption(parsed, 'reason'), now),
+        state: blockWorkflowTask(current, taskId, requiredOption(parsed, 'reason'), clock()),
         value: null,
       }))
       writeJson(io.stdout, { status: 'blocked', statePath: store.path, taskId })
