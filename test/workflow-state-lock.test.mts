@@ -78,8 +78,6 @@ test('a waiter cannot build on an old generation re-created by a lagging release
   const hooks = installLockFsHooks()
   try {
     const { run, overlaps } = transactionRunner(statePath, hooks)
-    const slot = (generation: number) => new RegExp(`\\.lock/${generation}$`)
-    const slotTemp = (generation: number) => new RegExp(`\\.lock/${generation}\\.\\d+\\..*\\.tmp$`)
 
     const rReleasing = hooks.gateCall('r', 'open', slotTemp(2))
     const r = run('r')
@@ -117,7 +115,8 @@ test('a waiter cannot build on an old generation re-created by a lagging release
     })
     await bInside.promise
 
-    const rChecking = hooks.gateCall('r', 'stat', slot(1))
+    // R has just re-created [2]; its own check (whatever it is) has not run yet.
+    const rChecking = hooks.gateCall('r', 'rm', slotTemp(2))
     rReleasing.release()
     await rChecking.reached
 
@@ -221,8 +220,141 @@ test('workflow state store refuses a legacy plain-file lock with a clear error',
   assert.equal(await store.read(), null)
 })
 
+// Finding A on 2eea8f66: R releases [1] by creating free [2]; W reads [2] and creates [3].
+// If R then sees [3] above its free slot and removes [2], W's check finds its predecessor
+// gone and removes [3] too, leaving [1] held by R, a live process that believes it
+// released. Every later transaction, including R's own next one, waits for the age limit.
+test('a release that a newer claim overtakes does not strand the lock', {
+  timeout: 20_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const hooks = installLockFsHooks()
+  try {
+    const { run, overlaps } = transactionRunner(statePath, hooks)
+    const rLinked = hooks.gateAfterCall('r', 'link', slotTemp(2))
+    const r = run('r')
+    await rLinked.reached
+
+    const wLinked = hooks.gateAfterCall('w', 'link', slotTemp(3))
+    const w = run('w', { lockTimeoutMs: 2_000 })
+    await wLinked.reached
+    assert.ok(wLinked.succeeded())
+
+    rLinked.release()
+    assert.equal(await r, 'r')
+    wLinked.release()
+    assert.equal(await w, 'w')
+    // The releasing process can take the lock again without waiting for its own record.
+    assert.equal(await run('r-again', { lockTimeoutMs: 2_000 }), 'r-again')
+
+    assert.deepEqual(overlaps, [])
+    const state = await new WorkflowStateStore(statePath).read()
+    assert.deepEqual(state?.tasks.map((entry) => entry.id).sort(), ['r', 'r-again', 'w'])
+  } finally {
+    hooks.uninstall()
+  }
+})
+
+// Finding B on 2eea8f66: the double back-off of finding A lowers the highest generation
+// from [3] to [1] while D holds an old observation of free [2]. R's process exits, W takes
+// over [1] and holds [2]; D creates [3] from its old observation and crashes before its
+// check; X then sees a dead holder at [3], creates [4], and enters while W is inside.
+test('an overtaken release cannot let a crashed stale claimant open the lock', {
+  timeout: 20_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const lockDir = `${statePath}.lock`
+  const hooks = installLockFsHooks()
+  try {
+    const { run, overlaps } = transactionRunner(statePath, hooks)
+    const rLinked = hooks.gateAfterCall('r', 'link', slotTemp(2))
+    const r = run('r')
+    await rLinked.reached
+
+    const dObserved = hooks.gateCall('d', 'open', slotTemp(3))
+    const d = run('d')
+    await dObserved.reached
+
+    const wLinked = hooks.gateAfterCall('w', 'link', slotTemp(3))
+    const wInside = deferred()
+    let wWrite: () => void = () => {}
+    const w = run('w', {
+      onEnter: () => wInside.resolve(),
+      beforeWrite: () =>
+        new Promise<void>((resolve) => {
+          wWrite = resolve
+        }),
+    })
+    await wLinked.reached
+
+    rLinked.release()
+    assert.equal(await r, 'r')
+    // R's process exits; its records now belong to a dead process.
+    const exited = await deadPid()
+    await rewriteHolderPid(join(lockDir, '1'), exited)
+
+    wLinked.release()
+    await wInside.promise
+
+    const dLinked = hooks.gateAfterCall('d', 'link', slotTemp(3))
+    dObserved.release()
+    await dLinked.reached
+    // D crashes right after creating its slot, before any check of its own.
+    if (dLinked.succeeded()) await rewriteHolderPid(join(lockDir, '3'), await deadPid())
+
+    const xInside = deferred()
+    const x = run('x', { onEnter: () => xInside.resolve() })
+    // A correct lock keeps X out while W holds it; give a broken one time to let X in.
+    await Promise.race([xInside.promise, delay(500)])
+    assert.deepEqual(overlaps, [])
+
+    wWrite()
+    dLinked.release()
+    assert.deepEqual((await Promise.all([w, d, x])).sort(), ['d', 'w', 'x'])
+    assert.deepEqual(overlaps, [])
+    const state = await new WorkflowStateStore(statePath).read()
+    assert.deepEqual(state?.tasks.map((entry) => entry.id).sort(), ['d', 'r', 'w', 'x'])
+  } finally {
+    hooks.uninstall()
+  }
+})
+
+test('a filesystem error right after claiming does not leave the lock held', {
+  timeout: 20_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const hooks = installLockFsHooks()
+  try {
+    const { run, overlaps } = transactionRunner(statePath, hooks)
+    const linked = hooks.gateAfterCall('f', 'link', slotTemp(1))
+    const failing = run('f')
+    await linked.reached
+    hooks.failCall('f', 'readdir', /\.lock$/)
+    linked.release()
+    await assert.rejects(failing, /injected EIO in readdir/)
+
+    // The same process can take the lock again without waiting for its own record.
+    assert.equal(await run('next', { lockTimeoutMs: 1_000 }), 'next')
+    assert.deepEqual(overlaps, [])
+  } finally {
+    hooks.uninstall()
+  }
+})
+
+async function rewriteHolderPid(path: string, pid: number): Promise<void> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return
+    throw error
+  }
+  await writeFile(path, JSON.stringify({ ...JSON.parse(text), pid }))
+}
+
 interface RunOptions {
   readonly lockStaleMs?: number
+  readonly lockTimeoutMs?: number
   readonly onEnter?: () => void
   readonly beforeWrite?: () => Promise<void>
 }
@@ -240,7 +372,7 @@ function transactionRunner(
   const overlaps: string[] = []
   const run = (name: string, options: RunOptions = {}) => {
     const store = new WorkflowStateStore(statePath, {
-      lockTimeoutMs: 10_000,
+      lockTimeoutMs: options.lockTimeoutMs ?? 10_000,
       lockStaleMs: options.lockStaleMs ?? 60_000,
     })
     const write = store.write.bind(store)
@@ -290,14 +422,25 @@ interface LockFsHooks {
   as<T>(name: string, run: () => Promise<T>): Promise<T>
   gateMutation(name: string, mutation: number): LockGate
   gateCall(name: string, operation: string, path: RegExp): LockGate
+  gateAfterCall(
+    name: string,
+    operation: string,
+    path: RegExp,
+  ): LockGate & { readonly succeeded: () => boolean }
+  // Makes the named waiter's next matching call fail with EIO.
+  failCall(name: string, operation: string, path: RegExp): void
   uninstall(): void
 }
+
+const slot = (generation: number) => new RegExp(`\\.lock/${generation}$`)
+const slotTemp = (generation: number) => new RegExp(`\\.lock/${generation}\\.\\d+\\..*\\.tmp$`)
 
 // Hooks fs/promises to pause a named waiter at a chosen point:
 // - gateMutation: before its Nth filesystem mutation after it first read a lock record of
 //   `deadPid`, which does not depend on the lock's internal layout;
 // - gateCall: at its next call of `operation` on a path matching `path`, armed from the
-//   moment the gate is created.
+//   moment the gate is created;
+// - gateAfterCall: the same, but after that call returned or failed.
 function installLockFsHooks(deadPid?: number): LockFsHooks {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<
     string,
@@ -311,10 +454,13 @@ function installLockFsHooks(deadPid?: number): LockFsHooks {
     name: string
     operation: string
     path: RegExp
+    after: boolean
     reached: () => void
     released: Promise<void>
+    result?: (succeeded: boolean) => void
   }[] = []
   const originals = new Map<string, (...args: unknown[]) => Promise<unknown>>()
+  const failures: { name: string; operation: string; path: RegExp }[] = []
 
   const hook = (operation: string, mutating: boolean) => {
     const original = fsp[operation]
@@ -332,15 +478,46 @@ function installLockFsHooks(deadPid?: number): LockFsHooks {
         }
       }
       const target = String(args[0])
-      const index = callGates.findIndex(
-        (gate) => gate.name === current && gate.operation === operation && gate.path.test(target),
-      )
-      const callGate = index >= 0 ? callGates.splice(index, 1)[0] : undefined
-      if (callGate) {
-        callGate.reached()
-        await callGate.released
+      const take = (after: boolean) => {
+        const index = callGates.findIndex(
+          (gate) =>
+            gate.name === current &&
+            gate.operation === operation &&
+            gate.after === after &&
+            gate.path.test(target),
+        )
+        return index >= 0 ? callGates.splice(index, 1)[0] : undefined
       }
-      const result = await original(...args)
+      const failure = failures.findIndex(
+        (entry) =>
+          entry.name === current && entry.operation === operation && entry.path.test(target),
+      )
+      if (failure >= 0) {
+        failures.splice(failure, 1)
+        throw Object.assign(new Error(`injected EIO in ${operation}`), { code: 'EIO' })
+      }
+      const before = take(false)
+      if (before) {
+        before.reached()
+        await before.released
+      }
+      const after = take(true)
+      let result: unknown
+      try {
+        result = await original(...args)
+      } catch (error) {
+        if (after) {
+          after.result?.(false)
+          after.reached()
+          await after.released
+        }
+        throw error
+      }
+      if (after) {
+        after.result?.(true)
+        after.reached()
+        await after.released
+      }
       if (
         current &&
         deadPid !== undefined &&
@@ -352,7 +529,7 @@ function installLockFsHooks(deadPid?: number): LockFsHooks {
       return result
     }
   }
-  for (const operation of ['readFile', 'stat']) hook(operation, false)
+  for (const operation of ['readFile', 'readdir', 'stat']) hook(operation, false)
   for (const operation of ['open', 'link', 'rename', 'rm', 'unlink', 'writeFile']) {
     hook(operation, true)
   }
@@ -381,10 +558,30 @@ function installLockFsHooks(deadPid?: number): LockFsHooks {
         name,
         operation,
         path,
+        after: false,
         reached: reached.resolve,
         released: released.promise,
       })
       return { reached: reached.promise, release: released.resolve }
+    },
+    gateAfterCall(name, operation, path) {
+      const { reached, released } = newGate()
+      let succeeded = false
+      callGates.push({
+        name,
+        operation,
+        path,
+        after: true,
+        reached: reached.resolve,
+        released: released.promise,
+        result: (value) => {
+          succeeded = value
+        },
+      })
+      return { reached: reached.promise, release: released.resolve, succeeded: () => succeeded }
+    },
+    failCall(name, operation, path) {
+      failures.push({ name, operation, path })
     },
     uninstall() {
       for (const release of releases) release()

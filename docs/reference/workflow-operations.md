@@ -11,6 +11,17 @@ The default state file is:
 ~/.codex/claude-codex-adapter/workflow-state.json
 ```
 
+## Concurrency
+
+Commands that change the state (`enqueue`, `schedule`, `heartbeat`, `complete`,
+`fail`, `block`, `ingest-github`) hold an exclusive lock, the
+`workflow-state.json.lock` directory, for their whole read-change-write, so
+several workers can share one state file. A lock left by a process that died on
+the same host is taken over at once; a lock whose holder cannot be checked (for
+example, on another host) is taken over after 5 minutes, and a command gives up
+after waiting 30 seconds. Keep the state on a local filesystem: network
+filesystems such as NFS are not supported.
+
 ## Core loop
 
 Start each heartbeat by reading the state through the CLI:

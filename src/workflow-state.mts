@@ -3,6 +3,16 @@ import { link, mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/
 import { hostname } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
+import {
+  advanceWorkflowStateLock,
+  startWorkflowStateLockAcquire,
+  startWorkflowStateLockRelease,
+  type WorkflowStateLockContext,
+  type WorkflowStateLockHeld,
+  type WorkflowStateLockMachine,
+  type WorkflowStateLockOutcome,
+  workflowStateLockOperation,
+} from './workflow-state-lock.mjs'
 
 export const WORKFLOW_STATE_VERSION = 1
 export const WORKFLOW_TASK_STATUSES = ['queued', 'running', 'blocked', 'done', 'failed'] as const
@@ -132,56 +142,146 @@ export class WorkflowStateStore {
   }
 }
 
-// The lock is a directory of numbered generations; the highest number is the current one.
-// Each generation is either held (a holder record) or free. Acquiring and releasing both
-// work by exclusively creating the next generation, so two waiters acting on the same
-// observation race for one slot and only one can win. A waiter with a stale observation
-// can therefore only fail to create an already-taken slot; nothing ever removes the
-// current generation, so a stale-lock takeover cannot displace a live holder. Old
-// generations are compacted away, so a lagging process can create a missing old slot
-// number again; `publishWorkflowStateLockGeneration` makes sure such a slot is never
-// treated as current.
+// The lock algorithm lives in `workflow-state-lock.mts` as a pure state machine (with its
+// safety argument); this module performs its filesystem operations. It needs a local
+// filesystem where creating a hard link is atomic and exclusive, records are immutable once
+// linked, and one listing of the small lock directory is a consistent snapshot; network
+// filesystems such as NFS are not supported.
 type WorkflowStateLockEntry =
   | ({ readonly state: 'held' } & WorkflowStateLockRecord)
   | { readonly state: 'free'; readonly token: string }
 
-interface WorkflowStateLockHead {
+interface WorkflowStateLockSlot {
   readonly generation: number
-  readonly text: string
   readonly entry: WorkflowStateLockEntry | null
   readonly mtimeMs: number
-}
-
-interface HeldWorkflowStateLock {
-  readonly generation: number
-  readonly token: string
 }
 
 const localHostname = hostname()
 const lockRetryMs = 10
 const lockGenerationPattern = /^\d+$/
+// Temporary records exist only between writing and linking them, so one this old was left
+// by a crashed process. Fixed, so a short stale-holder limit never removes a live one.
+const abandonedLockTempMs = 10 * 60 * 1000
 
 async function acquireWorkflowStateLock(
   path: string,
   options: { readonly timeoutMs: number; readonly staleMs: number },
 ): Promise<() => Promise<void>> {
   const lockDir = `${path}.lock`
-  const startedAt = Date.now()
   await ensureWorkflowStateLockDir(lockDir)
+  const created: { held: WorkflowStateLockHeld | null } = { held: null }
+  let machine: WorkflowStateLockMachine
+  try {
+    machine = await runWorkflowStateLock(
+      lockDir,
+      startWorkflowStateLockAcquire(),
+      options,
+      Date.now(),
+      created,
+    )
+    if (machine.step !== 'acquired') throw new Error(`workflow state lock ended ${machine.step}`)
+  } catch (error) {
+    // A filesystem error after creating a held slot must not leave it looking held by this
+    // live process. Releasing a slot is safe whether or not the claim was confirmed.
+    if (created.held) {
+      const held = created.held
+      await runWorkflowStateLock(lockDir, startWorkflowStateLockRelease(held), options, null).catch(
+        () => {},
+      )
+    }
+    throw error
+  }
+  const held = { generation: machine.generation, token: machine.token }
+  await removeAbandonedWorkflowStateLockTemps(lockDir).catch(() => {})
+  return async () => {
+    await runWorkflowStateLock(lockDir, startWorkflowStateLockRelease(held), options, null)
+  }
+}
 
+async function runWorkflowStateLock(
+  lockDir: string,
+  start: WorkflowStateLockMachine,
+  options: { readonly timeoutMs: number; readonly staleMs: number },
+  startedAt: number | null,
+  created: { held: WorkflowStateLockHeld | null } = { held: null },
+): Promise<WorkflowStateLockMachine> {
+  const context: WorkflowStateLockContext<WorkflowStateLockSlot> = {
+    isAvailable: (slot) => isWorkflowStateLockAvailable(slot, options.staleMs),
+    tokenOf: (slot) => slot.entry?.token ?? null,
+  }
+  let machine = start
+  let holder: WorkflowStateLockRecord | null = null
   while (true) {
-    const head = await readWorkflowStateLockHead(lockDir)
-    if (head && isWorkflowStateLockAvailable(head, options.staleMs)) {
-      const held = await claimWorkflowStateLockGeneration(lockDir, head)
-      if (held) return () => releaseWorkflowStateLock(lockDir, held)
+    const operation = workflowStateLockOperation(machine)
+    if (!operation) return machine
+    let outcome: WorkflowStateLockOutcome<WorkflowStateLockSlot>
+    switch (operation.type) {
+      case 'list':
+        outcome = { type: 'list', generations: await listWorkflowStateLockGenerations(lockDir) }
+        break
+      case 'read': {
+        const record = await readWorkflowStateLockGeneration(lockDir, operation.generation)
+        if (record?.entry?.state === 'held') holder = record.entry
+        outcome = { type: 'read', record }
+        break
+      }
+      case 'wait': {
+        const elapsedMs = startedAt === null ? 0 : Date.now() - startedAt
+        if (elapsedMs >= options.timeoutMs) {
+          throw new WorkflowStateLockTimeoutError(lockDir, options.timeoutMs, holder)
+        }
+        await delay(Math.min(lockRetryMs, options.timeoutMs - elapsedMs))
+        outcome = { type: 'wait' }
+        break
+      }
+      case 'create': {
+        const token = randomUUID()
+        const entry: WorkflowStateLockEntry =
+          operation.kind === 'held'
+            ? {
+                state: 'held',
+                pid: process.pid,
+                hostname: localHostname,
+                acquiredAt: new Date().toISOString(),
+                token,
+              }
+            : { state: 'free', token }
+        const linked = await linkWorkflowStateLockGeneration(lockDir, operation.generation, entry)
+        if (linked && operation.kind === 'held') {
+          created.held = { generation: operation.generation, token }
+        }
+        outcome = { type: 'create', token: linked ? token : null }
+        break
+      }
+      case 'remove':
+        await rm(join(lockDir, String(operation.generation)), { force: true })
+        outcome = { type: 'remove' }
+        break
     }
+    machine = advanceWorkflowStateLock(machine, outcome, context)
+  }
+}
 
-    const elapsedMs = Date.now() - startedAt
-    if (elapsedMs >= options.timeoutMs) {
-      const holder = head?.entry?.state === 'held' ? head.entry : null
-      throw new WorkflowStateLockTimeoutError(lockDir, options.timeoutMs, holder)
+// Best effort: temporary records and staging directories left by crashed processes.
+async function removeAbandonedWorkflowStateLockTemps(lockDir: string): Promise<void> {
+  const prefix = `${basename(lockDir)}.`
+  const candidates = [
+    ...(await readdir(lockDir))
+      .filter((name) => name.endsWith('.tmp'))
+      .map((name) => join(lockDir, name)),
+    ...(await readdir(dirname(lockDir)))
+      .filter((name) => name.startsWith(prefix) && name.endsWith('.tmp'))
+      .map((name) => join(dirname(lockDir), name)),
+  ]
+  for (const candidate of candidates) {
+    try {
+      if (Date.now() - (await stat(candidate)).mtimeMs >= abandonedLockTempMs) {
+        await rm(candidate, { recursive: true, force: true })
+      }
+    } catch (error) {
+      if (!hasErrorCode(error, 'ENOENT')) throw error
     }
-    await delay(Math.min(lockRetryMs, options.timeoutMs - elapsedMs))
   }
 }
 
@@ -224,86 +324,6 @@ async function rejectLegacyWorkflowStateLock(lockDir: string): Promise<never> {
   throw new WorkflowStateLockFormatError(lockDir, holder)
 }
 
-async function claimWorkflowStateLockGeneration(
-  lockDir: string,
-  predecessor: WorkflowStateLockHead,
-): Promise<HeldWorkflowStateLock | null> {
-  const generation = predecessor.generation + 1
-  const entry: WorkflowStateLockEntry = {
-    state: 'held',
-    pid: process.pid,
-    hostname: localHostname,
-    acquiredAt: new Date().toISOString(),
-    token: randomUUID(),
-  }
-  if (!(await publishWorkflowStateLockGeneration(lockDir, predecessor, entry))) return null
-  return { generation, token: entry.token }
-}
-
-async function releaseWorkflowStateLock(
-  lockDir: string,
-  { generation, token }: HeldWorkflowStateLock,
-): Promise<void> {
-  const holder = await readWorkflowStateLockGeneration(lockDir, generation)
-  if (holder?.entry?.token !== token) return
-  // If a stale takeover already superseded this generation, publishing fails and the newer
-  // holder is left alone.
-  await publishWorkflowStateLockGeneration(lockDir, holder, { state: 'free', token: randomUUID() })
-}
-
-// Creates `predecessor.generation + 1` and keeps it only if it is the current generation.
-//
-// Let L be the newest generation that passed these checks. Nothing removes slot L while
-// its holder relies on it: compaction only removes generations below the compacting
-// process's own one, and a process removes its own slot only when it backs off here,
-// before relying on it. A slot created from a stale observation (the observed generation
-// was compacted or superseded and the next number was free again) is therefore numbered
-// below L, and L, or a newer generation, is in the directory when that process lists it
-// again. So a new slot that sees a higher generation backs off, and one that sees none
-// was created from the current generation. Checking the predecessor first lets the
-// common superseded case back off without another listing.
-async function publishWorkflowStateLockGeneration(
-  lockDir: string,
-  predecessor: WorkflowStateLockHead,
-  entry: WorkflowStateLockEntry,
-): Promise<boolean> {
-  const generation = predecessor.generation + 1
-  if (!(await linkWorkflowStateLockGeneration(lockDir, generation, entry))) return false
-  if (
-    !(await isWorkflowStateLockPredecessorIntact(lockDir, predecessor)) ||
-    Math.max(...(await listWorkflowStateLockGenerations(lockDir))) > generation
-  ) {
-    await removeOwnWorkflowStateLockGeneration(lockDir, generation, entry.token)
-    return false
-  }
-  await compactWorkflowStateLock(lockDir, generation)
-  return true
-}
-
-async function removeOwnWorkflowStateLockGeneration(
-  lockDir: string,
-  generation: number,
-  token: string,
-): Promise<void> {
-  const current = await readWorkflowStateLockGeneration(lockDir, generation)
-  if (current?.entry?.token === token) await rm(join(lockDir, String(generation)), { force: true })
-}
-
-async function isWorkflowStateLockPredecessorIntact(
-  lockDir: string,
-  predecessor: WorkflowStateLockHead,
-): Promise<boolean> {
-  const current = await readWorkflowStateLockGeneration(lockDir, predecessor.generation)
-  return current?.text === predecessor.text
-}
-
-async function compactWorkflowStateLock(lockDir: string, current: number): Promise<void> {
-  const old = (await listWorkflowStateLockGenerations(lockDir))
-    .filter((generation) => generation < current)
-    .sort((left, right) => left - right)
-  for (const generation of old) await rm(join(lockDir, String(generation)), { force: true })
-}
-
 async function linkWorkflowStateLockGeneration(
   lockDir: string,
   generation: number,
@@ -344,22 +364,15 @@ async function listWorkflowStateLockGenerations(lockDir: string): Promise<number
     .filter(Number.isSafeInteger)
 }
 
-async function readWorkflowStateLockHead(lockDir: string): Promise<WorkflowStateLockHead | null> {
-  const generations = await listWorkflowStateLockGenerations(lockDir)
-  if (generations.length === 0) return null
-  // A missing head was compacted by a newer generation; the caller retries.
-  return readWorkflowStateLockGeneration(lockDir, Math.max(...generations))
-}
-
 async function readWorkflowStateLockGeneration(
   lockDir: string,
   generation: number,
-): Promise<WorkflowStateLockHead | null> {
+): Promise<WorkflowStateLockSlot | null> {
   const path = join(lockDir, String(generation))
   try {
     const info = await stat(path)
     const text = await readFile(path, 'utf8')
-    return { generation, text, entry: parseWorkflowStateLockEntry(text), mtimeMs: info.mtimeMs }
+    return { generation, entry: parseWorkflowStateLockEntry(text), mtimeMs: info.mtimeMs }
   } catch (error) {
     if (hasErrorCode(error, 'ENOENT')) return null
     throw error
@@ -394,7 +407,7 @@ function parseWorkflowStateLockEntry(text: string): WorkflowStateLockEntry | nul
   }
 }
 
-function isWorkflowStateLockAvailable(head: WorkflowStateLockHead, staleMs: number): boolean {
+function isWorkflowStateLockAvailable(head: WorkflowStateLockSlot, staleMs: number): boolean {
   const entry = head.entry
   if (entry?.state === 'free') return true
   if (entry?.hostname === localHostname) {
