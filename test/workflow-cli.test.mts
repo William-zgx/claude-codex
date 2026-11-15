@@ -298,6 +298,34 @@ test('workflow CLI renews a heartbeat lease after waiting for the state lock', {
   assert.ok(expiresAt > returnedAt, `lease expired ${returnedAt - expiresAt}ms before return`)
 })
 
+test('workflow CLI stamps ingested GitHub tasks after waiting for the state lock', {
+  timeout: 10_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const sourcePath = join(await mkdtemp(join(tmpdir(), 'claude-codex-github-json-')), 'items.json')
+  await writeFile(
+    sourcePath,
+    JSON.stringify([
+      { number: 7, title: 'Fix queue', url: 'https://github.com/acme/repo/issues/7' },
+    ]),
+  )
+
+  const holder = await holdWorkflowStateLock(statePath)
+  const io = captureIo()
+  const ingest = runWorkflowCli(
+    ['ingest-github', '--state', statePath, '--github-json', sourcePath],
+    io,
+  )
+  await delay(300)
+  const releasedAt = Date.now()
+  await holder.release()
+  assert.equal(await ingest, 0, io.stderrText())
+
+  const state = await new WorkflowStateStore(statePath).read()
+  const updatedAt = Date.parse(state?.tasks[0]?.updatedAt ?? '')
+  assert.ok(updatedAt >= releasedAt, `task stamped ${releasedAt - updatedAt}ms before the lock`)
+})
+
 test('workflow CLI keeps an explicit --now for lease timing', async () => {
   const statePath = await tempStatePath()
   await runWorkflowCli(

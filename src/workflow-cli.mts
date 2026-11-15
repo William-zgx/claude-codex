@@ -120,14 +120,17 @@ export async function runWorkflowCli(
     }
     case 'ingest-github': {
       const source = requiredOption(parsed, 'github-json')
-      const result = parseGitHubQueueJson(await readFile(source, 'utf8'), now)
-      await store.transact(emptyState(), (current) => ({
-        state: result.tasks.reduce(
-          (stateWithTasks, task) => upsertTask(stateWithTasks, task),
-          current,
-        ),
-        value: null,
-      }))
+      const text = await readFile(source, 'utf8')
+      const result = await store.transact(emptyState(), (current) => {
+        const ingested = parseGitHubQueueJson(text, clock())
+        return {
+          state: ingested.tasks.reduce(
+            (stateWithTasks, task) => upsertTask(stateWithTasks, task),
+            current,
+          ),
+          value: ingested,
+        }
+      })
       writeJson(io.stdout, {
         status: 'ingested',
         statePath: store.path,

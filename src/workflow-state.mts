@@ -76,6 +76,19 @@ export class WorkflowStateLockTimeoutError extends Error {
   }
 }
 
+export class WorkflowStateLockFormatError extends Error {
+  override readonly name = 'WorkflowStateLockFormatError'
+
+  constructor(path: string, holder: WorkflowStateLockRecord | null) {
+    super(
+      `${path} is a legacy plain-file lock from an earlier workflow CLI build ` +
+        `(holder pid ${holder?.pid ?? 'unknown'} on ${holder?.hostname ?? 'unknown host'} ` +
+        `since ${holder?.acquiredAt ?? 'unknown time'}); this build locks with a directory ` +
+        'at that path. Stop any older workflow CLI using this state, then remove the file.',
+    )
+  }
+}
+
 export class WorkflowStateStore {
   readonly path: string
   private readonly lockTimeoutMs: number
@@ -124,7 +137,10 @@ export class WorkflowStateStore {
 // work by exclusively creating the next generation, so two waiters acting on the same
 // observation race for one slot and only one can win. A waiter with a stale observation
 // can therefore only fail to create an already-taken slot; nothing ever removes the
-// current generation, so a stale-lock takeover cannot displace a live holder.
+// current generation, so a stale-lock takeover cannot displace a live holder. Old
+// generations are compacted away, so a lagging process can create a missing old slot
+// number again; `publishWorkflowStateLockGeneration` makes sure such a slot is never
+// treated as current.
 type WorkflowStateLockEntry =
   | ({ readonly state: 'held' } & WorkflowStateLockRecord)
   | { readonly state: 'free'; readonly token: string }
@@ -173,6 +189,7 @@ async function ensureWorkflowStateLockDir(lockDir: string): Promise<void> {
   await mkdir(dirname(lockDir), { recursive: true, mode: 0o700 })
   try {
     if ((await stat(lockDir)).isDirectory()) return
+    await rejectLegacyWorkflowStateLock(lockDir)
   } catch (error) {
     if (!hasErrorCode(error, 'ENOENT')) throw error
   }
@@ -184,10 +201,27 @@ async function ensureWorkflowStateLockDir(lockDir: string): Promise<void> {
     await writeWorkflowStateLockEntry(join(staging, '0'), { state: 'free', token: randomUUID() })
     await rename(staging, lockDir)
   } catch (error) {
+    if (hasErrorCode(error, 'ENOTDIR')) await rejectLegacyWorkflowStateLock(lockDir)
     if (!hasErrorCode(error, 'EEXIST') && !hasErrorCode(error, 'ENOTEMPTY')) throw error
   } finally {
     await rm(staging, { recursive: true, force: true })
   }
+}
+
+// An earlier build of this lock used a plain file at the same path. Its holder may still be
+// running that build, which cannot see this directory lock, so removing the file is left to
+// the operator instead of being guessed here.
+async function rejectLegacyWorkflowStateLock(lockDir: string): Promise<never> {
+  let holder: WorkflowStateLockRecord | null = null
+  try {
+    const entry = parseWorkflowStateLockEntry(
+      JSON.stringify({ state: 'held', ...JSON.parse(await readFile(lockDir, 'utf8')) }),
+    )
+    if (entry?.state === 'held') holder = entry
+  } catch {
+    // Report the legacy lock even when its record cannot be read.
+  }
+  throw new WorkflowStateLockFormatError(lockDir, holder)
 }
 
 async function claimWorkflowStateLockGeneration(
@@ -202,12 +236,7 @@ async function claimWorkflowStateLockGeneration(
     acquiredAt: new Date().toISOString(),
     token: randomUUID(),
   }
-  if (!(await linkWorkflowStateLockGeneration(lockDir, generation, entry))) return null
-  if (!(await isWorkflowStateLockPredecessorIntact(lockDir, predecessor))) {
-    await rm(join(lockDir, String(generation)), { force: true })
-    return null
-  }
-  await compactWorkflowStateLock(lockDir, generation)
+  if (!(await publishWorkflowStateLockGeneration(lockDir, predecessor, entry))) return null
   return { generation, token: entry.token }
 }
 
@@ -217,21 +246,49 @@ async function releaseWorkflowStateLock(
 ): Promise<void> {
   const holder = await readWorkflowStateLockGeneration(lockDir, generation)
   if (holder?.entry?.token !== token) return
-  const free: WorkflowStateLockEntry = { state: 'free', token: randomUUID() }
-  // If a stale takeover already superseded this generation the slot is taken and the
-  // newer holder is left alone.
-  if (!(await linkWorkflowStateLockGeneration(lockDir, generation + 1, free))) return
-  if (!(await isWorkflowStateLockPredecessorIntact(lockDir, holder))) {
-    await rm(join(lockDir, String(generation + 1)), { force: true })
-    return
-  }
-  await compactWorkflowStateLock(lockDir, generation + 1)
+  // If a stale takeover already superseded this generation, publishing fails and the newer
+  // holder is left alone.
+  await publishWorkflowStateLockGeneration(lockDir, holder, { state: 'free', token: randomUUID() })
 }
 
-// Compaction deletes old generations, so a slot number can be created again after it was
-// removed. Compaction deletes in ascending order, so if the predecessor still holds the
-// exact record we observed, the new slot was never used before and the predecessor was
-// still current when we created it.
+// Creates `predecessor.generation + 1` and keeps it only if it is the current generation.
+//
+// Let L be the newest generation that passed these checks. Nothing removes slot L while
+// its holder relies on it: compaction only removes generations below the compacting
+// process's own one, and a process removes its own slot only when it backs off here,
+// before relying on it. A slot created from a stale observation (the observed generation
+// was compacted or superseded and the next number was free again) is therefore numbered
+// below L, and L, or a newer generation, is in the directory when that process lists it
+// again. So a new slot that sees a higher generation backs off, and one that sees none
+// was created from the current generation. Checking the predecessor first lets the
+// common superseded case back off without another listing.
+async function publishWorkflowStateLockGeneration(
+  lockDir: string,
+  predecessor: WorkflowStateLockHead,
+  entry: WorkflowStateLockEntry,
+): Promise<boolean> {
+  const generation = predecessor.generation + 1
+  if (!(await linkWorkflowStateLockGeneration(lockDir, generation, entry))) return false
+  if (
+    !(await isWorkflowStateLockPredecessorIntact(lockDir, predecessor)) ||
+    Math.max(...(await listWorkflowStateLockGenerations(lockDir))) > generation
+  ) {
+    await removeOwnWorkflowStateLockGeneration(lockDir, generation, entry.token)
+    return false
+  }
+  await compactWorkflowStateLock(lockDir, generation)
+  return true
+}
+
+async function removeOwnWorkflowStateLockGeneration(
+  lockDir: string,
+  generation: number,
+  token: string,
+): Promise<void> {
+  const current = await readWorkflowStateLockGeneration(lockDir, generation)
+  if (current?.entry?.token === token) await rm(join(lockDir, String(generation)), { force: true })
+}
+
 async function isWorkflowStateLockPredecessorIntact(
   lockDir: string,
   predecessor: WorkflowStateLockHead,
