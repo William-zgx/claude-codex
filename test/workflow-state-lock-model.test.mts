@@ -643,7 +643,10 @@ test('lock model explorer finds the wedge (A) and overlap (B) in the 2eea8f66 al
   console.log(`2eea8f66 overlap (B), ${overlap.states} states:\n  ${overlap.overlap.join('\n  ')}`)
 })
 
-// The default bounds keep `npm test` fast; WORKFLOW_LOCK_MODEL=deep adds larger ones.
+// The default bounds keep `npm test` fast. WORKFLOW_LOCK_MODEL=deep adds larger ones, which
+// take minutes and need a large heap (2/2/2 explores about 2.6 million states):
+//   WORKFLOW_LOCK_MODEL=deep node --max-old-space-size=24000 --test \
+//     dist/test/workflow-state-lock-model.test.mjs
 const productionBounds: { transactions: number[]; staleTakeovers: number }[] =
   process.env.WORKFLOW_LOCK_MODEL === 'deep'
     ? [

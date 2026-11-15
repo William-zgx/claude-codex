@@ -326,6 +326,55 @@ test('workflow CLI stamps ingested GitHub tasks after waiting for the state lock
   assert.ok(updatedAt >= releasedAt, `task stamped ${releasedAt - updatedAt}ms before the lock`)
 })
 
+for (const { command, args, running } of [
+  {
+    command: 'enqueue',
+    args: ['--id', 'task-a', '--prompt', 'Integrate scheduler.'],
+    running: false,
+  },
+  { command: 'complete', args: ['--task', 'task-a'], running: true },
+  { command: 'fail', args: ['--task', 'task-a', '--error', 'Verification failed'], running: true },
+  { command: 'block', args: ['--task', 'task-a', '--reason', 'Needs a credential'], running: true },
+]) {
+  test(`workflow CLI stamps ${command} after waiting for the state lock`, {
+    timeout: 10_000,
+  }, async () => {
+    const statePath = await tempStatePath()
+    if (running) {
+      const at = ['--now', '2026-07-04T00:00:00.000Z']
+      await runWorkflowCli(
+        [
+          'enqueue',
+          '--state',
+          statePath,
+          '--id',
+          'task-a',
+          '--prompt',
+          'Integrate scheduler.',
+          ...at,
+        ],
+        captureIo(),
+      )
+      await runWorkflowCli(
+        ['schedule', '--state', statePath, '--worker', 'worker-a', ...at],
+        captureIo(),
+      )
+    }
+
+    const holder = await holdWorkflowStateLock(statePath)
+    const io = captureIo()
+    const pending = runWorkflowCli([command, '--state', statePath, ...args], io)
+    await delay(300)
+    const releasedAt = Date.now()
+    await holder.release()
+    assert.equal(await pending, 0, io.stderrText())
+
+    const state = await new WorkflowStateStore(statePath).read()
+    const updatedAt = Date.parse(state?.tasks[0]?.updatedAt ?? '')
+    assert.ok(updatedAt >= releasedAt, `task stamped ${releasedAt - updatedAt}ms before the lock`)
+  })
+}
+
 test('workflow CLI keeps an explicit --now for lease timing', async () => {
   const statePath = await tempStatePath()
   await runWorkflowCli(

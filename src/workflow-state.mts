@@ -127,14 +127,18 @@ export class WorkflowStateStore {
       timeoutMs: this.lockTimeoutMs,
       staleMs: this.lockStaleMs,
     })
+    let next: { state: WorkflowState; value: T }
     try {
       const current = (await this.read()) ?? fallback
-      const next = transition(current)
+      next = transition(current)
       await this.write(next.state)
-      return next.value
-    } finally {
-      await release()
+    } catch (error) {
+      await release().catch((releaseError: unknown) => warnWorkflowStateLockRelease(releaseError))
+      throw error
     }
+    // The transition is committed; a failed release must not report it as failed.
+    await release().catch((releaseError: unknown) => warnWorkflowStateLockRelease(releaseError))
+    return next.value
   }
 
   async write(state: WorkflowState): Promise<void> {
@@ -187,7 +191,7 @@ async function acquireWorkflowStateLock(
     if (created.held) {
       const held = created.held
       await runWorkflowStateLock(lockDir, startWorkflowStateLockRelease(held), options, null).catch(
-        () => {},
+        (releaseError: unknown) => warnWorkflowStateLockRelease(releaseError),
       )
     }
     throw error
@@ -247,10 +251,15 @@ async function runWorkflowStateLock(
                 token,
               }
             : { state: 'free', token }
-        const linked = await linkWorkflowStateLockGeneration(lockDir, operation.generation, entry)
-        if (linked && operation.kind === 'held') {
-          created.held = { generation: operation.generation, token }
-        }
+        const linked = await linkWorkflowStateLockGeneration(
+          lockDir,
+          operation.generation,
+          entry,
+          () => {
+            if (operation.kind === 'held')
+              created.held = { generation: operation.generation, token }
+          },
+        )
         outcome = { type: 'create', token: linked ? token : null }
         break
       }
@@ -328,6 +337,7 @@ async function linkWorkflowStateLockGeneration(
   lockDir: string,
   generation: number,
   entry: WorkflowStateLockEntry,
+  onLinked: () => void = () => {},
 ): Promise<boolean> {
   const tempPath = join(lockDir, `${generation}.${process.pid}.${randomUUID()}.tmp`)
   try {
@@ -335,13 +345,25 @@ async function linkWorkflowStateLockGeneration(
     // Hard-linking a complete record keeps exclusive-create semantics without ever
     // exposing a partially written generation.
     await link(tempPath, join(lockDir, String(generation)))
+    onLinked()
     return true
   } catch (error) {
     if (hasErrorCode(error, 'EEXIST')) return false
     throw error
   } finally {
-    await rm(tempPath, { force: true })
+    // Best effort: a leftover temporary record is harmless and removed later by age.
+    await rm(tempPath, { force: true }).catch(() => {})
   }
+}
+
+// Releasing writes no state, so a failure to release is reported without discarding the
+// transaction's outcome. The lock is then taken over once this process exits (or after the
+// stale limit).
+function warnWorkflowStateLockRelease(error: unknown): void {
+  process.emitWarning(
+    `workflow state lock release failed: ${error instanceof Error ? error.message : String(error)}`,
+    { code: 'CLAUDE_CODEX_WORKFLOW_LOCK_RELEASE' },
+  )
 }
 
 async function writeWorkflowStateLockEntry(
@@ -417,7 +439,9 @@ function isWorkflowStateLockAvailable(head: WorkflowStateLockSlot, staleMs: numb
       if (hasErrorCode(error, 'ESRCH')) return true
     }
   }
-  const acquiredAtMs = entry ? Date.parse(entry.acquiredAt) : head.mtimeMs
+  // A record without a readable acquisition time goes stale by its file age.
+  const parsedMs = entry ? Date.parse(entry.acquiredAt) : Number.NaN
+  const acquiredAtMs = Number.isFinite(parsedMs) ? parsedMs : head.mtimeMs
   return Number.isFinite(acquiredAtMs) && Date.now() - acquiredAtMs >= staleMs
 }
 

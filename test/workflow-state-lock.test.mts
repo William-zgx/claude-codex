@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, utimes, writeFile } from 'node:fs/promises'
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -340,6 +340,122 @@ test('a filesystem error right after claiming does not leave the lock held', {
     hooks.uninstall()
   }
 })
+
+test('a committed transaction returns its result when releasing the lock fails', {
+  timeout: 20_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const hooks = installLockFsHooks()
+  const warnings = captureWarnings()
+  try {
+    const { run } = transactionRunner(statePath, hooks)
+    // The release creates free [2]; make that fail after the state was written.
+    hooks.failCall('c', 'link', slotTemp(2))
+    assert.equal(await run('c'), 'c')
+
+    const state = await new WorkflowStateStore(statePath).read()
+    assert.deepEqual(
+      state?.tasks.map((entry) => entry.id),
+      ['c'],
+    )
+    assert.deepEqual(await warnings.codes(), ['CLAUDE_CODEX_WORKFLOW_LOCK_RELEASE'])
+    assert.match(warnings.messages()[0] ?? '', /injected EIO in link/)
+  } finally {
+    warnings.stop()
+    hooks.uninstall()
+  }
+})
+
+test('a failed temporary-record cleanup after claiming does not leave the lock held', {
+  timeout: 20_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const hooks = installLockFsHooks()
+  try {
+    const { run, overlaps } = transactionRunner(statePath, hooks)
+    // Removing the temporary record fails right after [1] was linked.
+    hooks.failCall('f', 'rm', slotTemp(1))
+    const first = await run('f', { lockTimeoutMs: 1_000 }).catch((error: unknown) => error)
+
+    // Whether or not the first transaction went through, the lock is not left held.
+    assert.equal(await run('next', { lockTimeoutMs: 1_000 }), 'next')
+    assert.deepEqual(overlaps, [])
+    if (first instanceof Error) assert.match(first.message, /injected EIO in rm/)
+  } finally {
+    hooks.uninstall()
+  }
+})
+
+test('a failed release after a failed claim is reported, not swallowed', {
+  timeout: 20_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const hooks = installLockFsHooks()
+  const warnings = captureWarnings()
+  try {
+    const { run } = transactionRunner(statePath, hooks)
+    const linked = hooks.gateAfterCall('f', 'link', slotTemp(1))
+    const failing = run('f')
+    await linked.reached
+    hooks.failCall('f', 'readdir', /\.lock$/)
+    hooks.failCall('f', 'link', slotTemp(2))
+    linked.release()
+    await assert.rejects(failing, /injected EIO in readdir/)
+    assert.deepEqual(await warnings.codes(), ['CLAUDE_CODEX_WORKFLOW_LOCK_RELEASE'])
+    assert.match(warnings.messages()[0] ?? '', /injected EIO in link/)
+  } finally {
+    warnings.stop()
+    hooks.uninstall()
+  }
+})
+
+test('a held record with an unreadable acquisition time goes stale by its file age', {
+  timeout: 5_000,
+}, async () => {
+  const statePath = await tempStatePath()
+  const lockDir = `${statePath}.lock`
+  await mkdir(lockDir)
+  const slotPath = join(lockDir, '4')
+  await writeFile(
+    slotPath,
+    JSON.stringify({
+      state: 'held',
+      pid: process.pid,
+      hostname: hostname(),
+      acquiredAt: 'not a time',
+      token: 'corrupt',
+    }),
+  )
+  const old = new Date(Date.now() - 120_000)
+  await utimes(slotPath, old, old)
+  const store = new WorkflowStateStore(statePath, { lockTimeoutMs: 1_000, lockStaleMs: 60_000 })
+
+  assert.equal(
+    await store.transact(emptyState(), (current) => ({ state: current, value: 'taken over' })),
+    'taken over',
+  )
+})
+
+function captureWarnings(): {
+  codes(): Promise<string[]>
+  messages(): string[]
+  stop(): void
+} {
+  const warnings: (Error & { code?: string })[] = []
+  const listener = (warning: Error & { code?: string }) => {
+    if (warning.code?.startsWith('CLAUDE_CODEX_')) warnings.push(warning)
+  }
+  process.on('warning', listener)
+  return {
+    async codes() {
+      // Warnings are emitted on a later tick.
+      await delay(10)
+      return warnings.map((warning) => warning.code ?? '')
+    },
+    messages: () => warnings.map((warning) => warning.message),
+    stop: () => process.off('warning', listener),
+  }
+}
 
 async function rewriteHolderPid(path: string, pid: number): Promise<void> {
   let text: string

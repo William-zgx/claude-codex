@@ -14,6 +14,8 @@ Tests run with the built-in `node:test` runner against compiled output. See the
 npm test            # builds, then runs node --test dist/test/*.mjs
 npm run build       # if you want to compile without running
 node --test dist/test/adapter.test.mjs   # a single suite, after a build
+# Exhaustive lock model with larger bounds (minutes, needs a large heap):
+WORKFLOW_LOCK_MODEL=deep node --max-old-space-size=24000 --test dist/test/workflow-state-lock-model.test.mjs
 ```
 
 ## Conventions

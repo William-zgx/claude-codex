@@ -16,11 +16,32 @@ The default state file is:
 Commands that change the state (`enqueue`, `schedule`, `heartbeat`, `complete`,
 `fail`, `block`, `ingest-github`) hold an exclusive lock, the
 `workflow-state.json.lock` directory, for their whole read-change-write, so
-several workers can share one state file. A lock left by a process that died on
-the same host is taken over at once; a lock whose holder cannot be checked (for
-example, on another host) is taken over after 5 minutes, and a command gives up
-after waiting 30 seconds. Keep the state on a local filesystem: network
-filesystems such as NFS are not supported.
+several workers can share one state file. A command gives up after waiting 30
+seconds for the lock.
+
+A lock is taken over from its holder when:
+
+- the holder is a process on the same host (same hostname) that no longer exists,
+  which is detected at once; or
+- the lock is older than 5 minutes, whatever the holder. This includes a live
+  holder on the same host whose transaction takes longer than that.
+
+Limits:
+
+- Keep the state on a local filesystem. Network filesystems such as NFS are not
+  supported.
+- Takeover by age is not fenced: a holder that is taken over after 5 minutes but
+  is still running can still write the state file, so its write and the new
+  holder's can overlap. Transactions take milliseconds, so this needs a stalled
+  process.
+- The dead-process check compares hostnames and process IDs. Processes that
+  share the state directory and the hostname but not a PID namespace (for
+  example, the host and a `--net=host` container) see each other's live
+  processes as dead and can take over a held lock. Give such workers separate
+  state files.
+- A lock record whose acquisition time cannot be read goes stale by its file's
+  modification time. If the contents of the lock directory are deleted by hand,
+  commands wait until their timeout; remove the empty directory to recover.
 
 ## Core loop
 
