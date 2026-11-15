@@ -644,30 +644,32 @@ test('lock model explorer finds the wedge (A) and overlap (B) in the 2eea8f66 al
 })
 
 // The default bounds keep `npm test` fast; WORKFLOW_LOCK_MODEL=deep adds larger ones.
-const productionBounds =
+const productionBounds: { transactions: number[]; staleTakeovers: number }[] =
   process.env.WORKFLOW_LOCK_MODEL === 'deep'
     ? [
-        [1, 1, 1],
-        [2, 1, 1],
-        [2, 2, 1],
-        [2, 2, 2],
-        [1, 1, 1, 1],
+        { transactions: [1, 1, 1], staleTakeovers: 1 },
+        { transactions: [2, 1, 1], staleTakeovers: 1 },
+        { transactions: [2, 2, 1], staleTakeovers: 1 },
+        { transactions: [2, 2, 2], staleTakeovers: 1 },
+        { transactions: [1, 1, 1], staleTakeovers: 2 },
+        { transactions: [1, 1, 1, 1], staleTakeovers: 0 },
       ]
     : [
-        [1, 1, 1],
-        [2, 1, 1],
+        { transactions: [1, 1, 1], staleTakeovers: 1 },
+        { transactions: [2, 1, 1], staleTakeovers: 1 },
       ]
 
-for (const transactions of productionBounds) {
-  test(`lock model: production lock is exclusive and cannot wedge, transactions ${transactions.join('/')}`, () => {
+for (const { transactions, staleTakeovers } of productionBounds) {
+  const bound = `transactions ${transactions.join('/')}, ${staleTakeovers} stale`
+  test(`lock model: production lock is exclusive and cannot wedge, ${bound}`, () => {
     const result = explore(productionLock, {
       transactions,
       crashes: true,
-      staleTakeovers: 1,
+      staleTakeovers,
       ...generous,
     })
     console.log(
-      `production lock ${transactions.join('/')}: ${result.states} states, ${result.edges} edges, ` +
+      `production lock ${bound}: ${result.states} states, ${result.edges} edges, ` +
         `${result.truncated} truncated`,
     )
     assert.ok(result.overlap === null, result.overlap?.join('\n') ?? '')
