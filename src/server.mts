@@ -3024,8 +3024,11 @@ export class CodexClaudeAppServer {
     return thread
   }
 
-  private saveQueue(threadId: string, items: QueuedSubmission[]): void {
-    this.store.saveQueue(threadId, items)
+  private mutateQueue(
+    threadId: string,
+    body: (items: QueuedSubmission[]) => QueuedSubmission[],
+  ): void {
+    this.store.mutateQueue(threadId, body)
     this.notifyThread(threadId, { method: 'thread/queue/changed', params: { threadId } })
   }
 
@@ -3044,7 +3047,7 @@ export class CodexClaudeAppServer {
       input: queuedInput(params.input),
       clientUserMessageId: nullIfEmpty(stringOr(params.clientUserMessageId, '')),
     }
-    this.saveQueue(threadId, [...this.store.listQueue(threadId), submission])
+    this.mutateQueue(threadId, (items) => [...items, submission])
     if (!this.activeTurnByThread.has(threadId) && !this.queueHeld(threadId))
       setImmediate(() => this.startFollowUp(threadId))
     return { queuedSubmission: submission }
@@ -3061,14 +3064,15 @@ export class CodexClaudeAppServer {
     this.queueThread(threadId)
     this.subscribe(threadId, peer)
     const id = stringOr(params.queuedSubmissionId, '')
-    const updated: QueuedSubmission = {
-      ...this.queuedSubmission(threadId, id),
-      input: queuedInput(params.input),
-    }
-    this.saveQueue(
-      threadId,
-      this.store.listQueue(threadId).map((entry) => (entry.id === id ? updated : entry)),
-    )
+    const input = queuedInput(params.input)
+    let updated: QueuedSubmission | undefined
+    this.mutateQueue(threadId, (items) => {
+      const current = items.find((entry) => entry.id === id)
+      if (!current) throw invalidRequest(`unknown queued submission: ${id}`)
+      const next = { ...current, input }
+      updated = next
+      return items.map((entry) => (entry.id === id ? next : entry))
+    })
     return { queuedSubmission: updated }
   }
 
@@ -3077,11 +3081,13 @@ export class CodexClaudeAppServer {
     this.queueThread(threadId)
     this.subscribe(threadId, peer)
     const id = stringOr(params.queuedSubmissionId, '')
-    const items = this.store.listQueue(threadId)
-    const rest = items.filter((entry) => entry.id !== id)
-    if (rest.length === items.length) return { deleted: false }
-    this.saveQueue(threadId, rest)
-    return { deleted: true }
+    let deleted = false
+    this.mutateQueue(threadId, (items) => {
+      const rest = items.filter((entry) => entry.id !== id)
+      deleted = rest.length !== items.length
+      return rest
+    })
+    return { deleted }
   }
 
   private threadQueueReorder(peer: RpcPeer, params: Record<string, unknown>): unknown {
@@ -3091,15 +3097,17 @@ export class CodexClaudeAppServer {
     const order = Array.isArray(params.queuedSubmissionIds)
       ? params.queuedSubmissionIds.filter((id): id is string => typeof id === 'string')
       : []
-    const byId = new Map(this.store.listQueue(threadId).map((entry) => [entry.id, entry]))
-    const reordered: QueuedSubmission[] = []
-    for (const id of order) {
-      const entry = byId.get(id)
-      if (!entry) continue
-      byId.delete(id)
-      reordered.push(entry)
-    }
-    this.saveQueue(threadId, [...reordered, ...byId.values()])
+    this.mutateQueue(threadId, (items) => {
+      const byId = new Map(items.map((entry) => [entry.id, entry]))
+      const reordered: QueuedSubmission[] = []
+      for (const id of order) {
+        const entry = byId.get(id)
+        if (!entry) continue
+        byId.delete(id)
+        reordered.push(entry)
+      }
+      return [...reordered, ...byId.values()]
+    })
     return {}
   }
 
@@ -3131,7 +3139,8 @@ export class CodexClaudeAppServer {
   }
 
   // Runs one queued submission as a regular user turn. The submission leaves
-  // the queue only once its turn exists, so a rejected start keeps it.
+  // the queue in the turn's claim transaction, so a rejected start keeps it
+  // and a crash cannot commit a claimed turn without its dequeue.
   private async dispatchQueued(
     peer: RpcPeer,
     threadId: string,
@@ -3144,11 +3153,9 @@ export class CodexClaudeAppServer {
         ? { clientUserMessageId: submission.clientUserMessageId }
         : {}),
       _emitUserMessage: true,
+      _queuedSubmissionId: submission.id,
     })
-    this.saveQueue(
-      threadId,
-      this.store.listQueue(threadId).filter((entry) => entry.id !== submission.id),
-    )
+    this.notifyThread(threadId, { method: 'thread/queue/changed', params: { threadId } })
     return result
   }
 
@@ -4647,6 +4654,17 @@ export class CodexClaudeAppServer {
         if (!isDeepStrictEqual(latest, initialThread))
           throw invalidRequest('the thread changed while starting the turn; retry the request')
         this.store.upsertThread(thread)
+        const queuedSubmissionId = stringOr(params._queuedSubmissionId, '')
+        if (queuedSubmissionId) {
+          const items = this.store.listQueue(threadId)
+          if (!items.some((entry) => entry.id === queuedSubmissionId))
+            throw invalidRequest(`unknown queued submission: ${queuedSubmissionId}`)
+          // The turn and its dequeue commit or roll back together in claimTurn.
+          this.store.saveQueue(
+            threadId,
+            items.filter((entry) => entry.id !== queuedSubmissionId),
+          )
+        }
       })
       if (claim.claimed) break
       const ownedHere = this.activeTurnByThread.get(threadId) === claim.activeTurn.id
@@ -5563,6 +5581,7 @@ export class CodexClaudeAppServer {
         _imageInputs: _images,
         _promptContext: _context,
         _emitUserMessage: _emit,
+        _queuedSubmissionId: _queuedSubmission,
         ...rest
       } = params
       this.lastTurnParamsByThread.set(thread.id, rest)
