@@ -43,6 +43,23 @@ versioning or publishing metadata.
   the rest of its process group with it, as a stopped one does, so helpers it
   started, such as MCP servers that ignore stdin EOF, no longer run on after
   every crash. (#334)
+- Archiving or deleting a native Codex chat now also interrupts the turns of
+  the subagent threads it spawned, and is refused while one of them runs in
+  another adapter. Such a turn used to run on in the deleted chat and keep the
+  adapter busy for good: its idle Codex child never stopped and the daemon
+  never idle-exited. A turn Codex says it no longer runs counts as ended
+  instead of failing every retry, and when Codex does not stop a turn within
+  `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` the change fails and the chat stays, where
+  it used to wait forever. (#344)
+- A native turn Codex accepted but has not announced yet (a shell command,
+  review or compaction) now keeps the Codex child and the daemon up. A small
+  `CLAUDE_CODEX_NATIVE_IDLE_MS` could stop the child in that gap and end the
+  compaction it had just begun. (#344)
+- An inline native review is tracked from Codex's answer, which carries its
+  turn: it holds the chat until Codex ends it, and archive or delete
+  interrupts it even before Codex announces it. The adapter used to wait for
+  the announcement for `CLAUDE_CODEX_NATIVE_TURN_WAIT_MS` at most and then
+  let the chat go while the review still ran. (#344)
 - With native mode on, `thread/items/read`, `thread/memory/read` and
   `thread/readState/update` for a native Codex chat go to its Codex child,
   like the chat's other history requests. The App can load a command output
@@ -253,6 +270,40 @@ versioning or publishing metadata.
 
 ### App-server and protocol compatibility
 
+- Codex App 26.1111 is a verified build, checked against the App rules from
+  its bundle (`docs/reference/app-compat.md` notes what changed). The adapter
+  still reports app-server `0.163.0-alpha.10.2`, which turns on five of
+  26.1111's new gates, all served, and keeps off those whose features Claude
+  threads cannot serve, such as saving diagnostics through `feedback/save`.
+  The 0.169 protocol's `account/securitySetup/read`, `thread/guardianReview`
+  and `thread/prepareApprovedPlan`, which the App never sends, answer method
+  not found. (#347)
+- Codex App 26.1111 names itself `Codex Desktop` in `initialize` instead of
+  `codex_desktop`. The adapter takes either name for the desktop App, so it
+  reports an App build missing from the verified list again (a
+  `configWarning` in Settings, and on stderr); 26.1111 connected without
+  that warning. (#347)
+- `npm run check:app-upgrade` reads Codex App 26.1111 bundles again: their
+  double-quoted strings, gates without a version (shown as "never"), the
+  minimum version in a constant of its own, and a `clientInfo` name taken from
+  another module. Against 26.1111 it reported no gate table, no minimum and no
+  desktop client name. It also notes a gate the adapter's version no longer
+  turns on (26.1111's `asyncCompaction` needs `0.163.0-alpha.11`), counts a
+  case that throws an `RpcError` with `METHOD_NOT_FOUND` as answering
+  "method not found", and lists one whose `// App rule:` comment says why as
+  "-32601 by design" instead of as a problem. A version that turns on a gate
+  listed in `KEPT_OFF_GATES` (26.1111's `feedbackSave`, `gcpSetup`,
+  `modelProviderSetup` and the gates not examined yet) is a problem. (#347)
+- With `CLAUDE_CODEX_APP_MCP_SERVERS=1`, editing a server under Settings >
+  MCP servers works with Codex App 26.1111, which saves the changed fields one
+  by one with quoted keys (`mcp_servers."name"."env"."KEY"`). Every such save
+  used to fail with "invalid MCP server name". A server is now checked once
+  all edits of a save are made, so moving one from a command to a URL works,
+  and the debug log keeps the values of quoted `env`, header, `args` and
+  `url` keys out as it does for plain ones. (#347)
+- The note that tells Claude which Codex App tools it lacks also names
+  `delete_thread`, which App 26.1111's thread instructions mention. (#347)
+
 - Ten of the eleven requests Codex App 26.1111 newly calls no longer fail
   with "method not found". `thread/items/read` returns the stored items it
   names, `thread/memory/read` reports no memory summary, `modelProvider/list`
@@ -366,6 +417,13 @@ versioning or publishing metadata.
   A file whose directory does not exist yet (`.git/HEAD` before `git init`)
   is watched from the nearest existing folder, as Codex does, instead of
   failing with `ENOENT`. (#333)
+- `fs/watch` on a file keeps working when a folder on the way to it is deleted
+  and created again, such as `.git` in `rm -rf .git && git init`. As in Codex,
+  the watch picks the nearest existing folder again on every event and moves
+  to the new folder, also when it is already back by then; on Linux it used
+  to stop for good. A folder created while the watch moves down to it is no
+  longer missed, and on macOS a watch whose nearest existing folder is `/`
+  now sees its entry. (#348)
 - `fs/readDirectory` lists a symlink as the file or folder it points to, as
   `fs/getMetadata` and Codex do, and leaves out a dangling link. Linked files
   such as `CLAUDE.md -> AGENTS.md` and linked package folders used to show as
@@ -523,6 +581,10 @@ versioning or publishing metadata.
 - After an interrupt, the queue stays held until `thread/queue/start` or the
   user's next message. A `!` shell command, review or compaction in between
   used to send the next queued message on its own. (#335)
+- That hold also outlives an adapter restart, such as the unix daemon's idle
+  exit 15 s after the App disconnects: a `!` shell command, review or
+  compaction after the interrupt and another one after the restart no longer
+  send the next queued message. (#351)
 - The context gauge follows the main loop's latest API call, like Codex's
   `last_token_usage`, and tokens spent by subagents and workflows count toward
   the thread total without moving the gauge or goal progress.
@@ -1013,6 +1075,17 @@ versioning or publishing metadata.
 
 ### Trustworthy history and settings
 
+- `runs.jsonl`, the run registry, rotates like `debug.jsonl`: at
+  `CLAUDE_CODEX_DEBUG_LOG_MAX_BYTES` (50 MiB by default) it moves to
+  `runs.jsonl.1`, and `CLAUDE_CODEX_DEBUG_LOG_KEEP` old files (3 by default)
+  stay, all readable by their owner alone. An adapter appends to it on every
+  thread, turn and subagent event, and it used to grow for as long as the
+  adapter home existed. (#350)
+- When the background cleanup of the turn diffs older versions stored stops
+  on a failed write, such as another adapter holding the state database past
+  its busy timeout, the debug log says so (`store.diff_clear_stopped`, with
+  the error). It used to stop without a trace; the next start still goes on
+  where it stopped. (#350)
 - Settings saves from adapters whose `config.json` is a link to one shared
   file all stay. Each save is now locked next to the file the link points to,
   in an empty owner-only `config.json.lock.sqlite`, as the shared Claude model
@@ -1223,6 +1296,12 @@ versioning or publishing metadata.
 
 ### Provider and multi-agent boundaries
 
+- A long-running adapter no longer keeps every background agent it ran, each
+  with its full prompt, until its chat is deleted. It keeps the 256 that
+  finished last, without their prompts, which their child threads hold. A
+  SendMessage to an older agent reopens its child thread as one to an agent
+  from before a restart does, and that lookup now finds the agent by name,
+  also in a chat with more than 200 agents. (#350)
 - **Behavior change:** a Codex (`gpt-*`) chat on the `codex-proxy` route that
   has no sandbox stored runs `codex exec` with `-s workspace-write`, the
   sandbox the App shows for it. It used to run with
